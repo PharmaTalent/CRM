@@ -1,7 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ============================================================================
-// generate-outreach-messages v10
+// generate-outreach-messages v11
 //
 // COMPLETE REWRITE of the message generation engine.
 //
@@ -122,7 +122,7 @@ function inferFunction(title: string): string {
   return "General";
 }
 
-function classifyRole(dm: any, jobs: any[]): RoleClassification {
+function classifyRole(dm: any, jobs: any[], confirmedMatches: ConfirmedMatch[] = []): RoleClassification {
   const title = dm.headline || dm.current_title || "";
   const tenureMonths = computeTenureMonths(dm.start_date_current_role);
 
@@ -135,6 +135,39 @@ function classifyRole(dm: any, jobs: any[]): RoleClassification {
 
   const dmSeniority = inferSeniority(title);
   const dmFunction = inferFunction(title);
+
+  // ── PRIORITY: User-confirmed matches override all heuristics ──
+  if (confirmedMatches.length > 0) {
+    const primary = confirmedMatches[0];
+    const jobTitle = primary.job?.job_title || "confirmed open role";
+    const angle = primary.suggested_angle || "HIRING_MANAGER";
+
+    const matchedJobs: MatchedJob[] = confirmedMatches
+      .filter(cm => cm.job)
+      .map(cm => ({
+        jobId: cm.job_id,
+        jobTitle: cm.job?.job_title || "",
+        jobUrl: cm.job?.job_url || null,
+        jobFunction: inferFunction(cm.job?.job_title || ""),
+        seniorityDiff: dmSeniority - inferSeniority(cm.job?.job_title || ""),
+        location: cm.job?.location || null,
+        isEnriched: cm.job?.is_enriched === true,
+        outreachHook: cm.job?.outreach_hook || null,
+      }));
+
+    const classification: Classification = angle === "NETWORK_CONNECTOR" ? "INFLUENCER" : "HIRING_MANAGER";
+    return {
+      classification,
+      roleCategory: `Decision Maker — ${dmFunction} (user-confirmed match)`,
+      reasoning: `USER-CONFIRMED: ${primary.match_reasoning}${primary.reviewer_notes ? ` | Notes: ${primary.reviewer_notes}` : ""}`,
+      matchedJobTitle: jobTitle,
+      matchedJobFunction: inferFunction(jobTitle),
+      matchedJobs,
+      isHiringManager: classification === "HIRING_MANAGER",
+      tenureMonths,
+      tenureBand,
+    };
+  }
 
   // Skip talent prospects — we only care about decision makers
   if (dmSeniority < 2) {
@@ -228,6 +261,18 @@ function classifyRole(dm: any, jobs: any[]): RoleClassification {
   };
 }
 
+interface ConfirmedMatch {
+  match_id: string;
+  job_id: string;
+  match_score: number;
+  match_reasoning: string;
+  match_factors: any;
+  talking_points: string[];
+  suggested_angle: string;
+  reviewer_notes: string | null;
+  job?: any; // joined job data
+}
+
 interface Intel {
   dm: any;
   company: any;
@@ -241,6 +286,7 @@ interface Intel {
   salesTarget: any;
   news: any[];
   roleClassification: RoleClassification;
+  confirmedMatches: ConfirmedMatch[];
 }
 
 async function gatherIntel(dmId: string, taId: string): Promise<Intel> {
@@ -311,10 +357,38 @@ async function gatherIntel(dmId: string, taId: string): Promise<Intel> {
     trials = trRes.data ?? [];
   }
 
-  const roleClassification = classifyRole(dm, jobs);
+  // Fetch user-confirmed matches from job_dm_matches
+  const { data: confirmedMatchRows } = await supabase
+    .from("job_dm_matches")
+    .select("match_id, job_id, match_score, match_reasoning, match_factors, talking_points, suggested_angle, reviewer_notes")
+    .eq("dm_id", dmId)
+    .eq("status", "confirmed")
+    .order("match_score", { ascending: false });
+
+  const confirmedMatches: ConfirmedMatch[] = [];
+  if (confirmedMatchRows && confirmedMatchRows.length > 0) {
+    // Enrich with job data
+    const matchJobIds = confirmedMatchRows.map((m: any) => m.job_id);
+    const { data: matchJobs } = await supabase
+      .from("job_postings")
+      .select("*")
+      .in("job_id", matchJobIds);
+
+    const jobMap = new Map((matchJobs || []).map((j: any) => [j.job_id, j]));
+    for (const row of confirmedMatchRows) {
+      confirmedMatches.push({
+        ...row,
+        talking_points: Array.isArray(row.talking_points) ? row.talking_points : [],
+        job: jobMap.get(row.job_id) || null,
+      });
+    }
+    console.log(`[intel] Found ${confirmedMatches.length} confirmed job matches for this DM`);
+  }
+
+  const roleClassification = classifyRole(dm, jobs, confirmedMatches);
   console.log(`[classify] ${roleClassification.classification} | ${roleClassification.roleCategory} | ${roleClassification.reasoning}`);
 
-  return { dm, company, companyId, jobs, enrichedJobs, confirmedTAJobs, assets, milestones, trials, salesTarget, news, roleClassification };
+  return { dm, company, companyId, jobs, enrichedJobs, confirmedTAJobs, assets, milestones, trials, salesTarget, news, roleClassification, confirmedMatches };
 }
 
 const PHASE_RANK: Record<string, number> = {
@@ -540,6 +614,33 @@ function buildUserPrompt(intel: Intel, valueHook: ValueHook): string {
   if (valueHook.stage) p += `Pipeline stage: ${valueHook.stage}\n`;
   p += `\n`;
 
+  // User-confirmed match context — HIGHEST PRIORITY intel
+  if (intel.confirmedMatches && intel.confirmedMatches.length > 0) {
+    p += `=== USER-CONFIRMED JOB MATCHES (use these as primary outreach angle) ===\n`;
+    p += `The following job-to-person matches have been MANUALLY REVIEWED AND CONFIRMED by our team.\n`;
+    p += `These are the MOST IMPORTANT signals — build the outreach around them.\n\n`;
+    intel.confirmedMatches.forEach((cm, i) => {
+      p += `  CONFIRMED MATCH ${i + 1}:\n`;
+      p += `    Job: ${cm.job?.job_title || "Unknown"} at ${cm.job?.company_name || "Unknown"}\n`;
+      p += `    Match Score: ${cm.match_score}/100\n`;
+      p += `    Why matched: ${cm.match_reasoning}\n`;
+      p += `    Suggested approach: ${cm.suggested_angle}\n`;
+      if (cm.talking_points && cm.talking_points.length > 0) {
+        p += `    TALKING POINTS (use these in the messages):\n`;
+        cm.talking_points.forEach((tp: string) => { p += `      - ${tp}\n`; });
+      }
+      if (cm.reviewer_notes) {
+        p += `    Reviewer notes: ${cm.reviewer_notes}\n`;
+      }
+      if (cm.job) {
+        if (cm.job.location) p += `    Job location: ${cm.job.location}\n`;
+        if (cm.job.enrichment_summary) p += `    Job context: ${cm.job.enrichment_summary}\n`;
+        if (cm.job.outreach_hook) p += `    Job-specific hook: ${cm.job.outreach_hook}\n`;
+      }
+      p += `\n`;
+    });
+  }
+
   // Job data — only for hiring managers
   if (roleClassification.isHiringManager && (valueHook.job || jobs.length > 0)) {
     p += `=== OPEN ROLES (this person is a HIRING MANAGER) ===\n`;
@@ -701,7 +802,8 @@ function qualityControl(messages: any, classification: Classification): QCResult
 
 async function saveOutreach(
   dm: any, taId: string, companyId: string | null,
-  messages: any, roleClassification: RoleClassification, valueHook: ValueHook, qc: QCResult
+  messages: any, roleClassification: RoleClassification, valueHook: ValueHook, qc: QCResult,
+  confirmedMatches: ConfirmedMatch[] = []
 ) {
   const { data: existing } = await supabase
     .from("outreach_campaigns").select("campaign_id")
@@ -746,18 +848,30 @@ async function saveOutreach(
     matched_job_id: roleClassification.matchedJobs.length > 0 ? roleClassification.matchedJobs[0].jobId : null,
   }).eq("dm_id", dm.dm_id);
 
+  let campaign: any;
   if (existing && existing.length > 0) {
     const { data, error } = await supabase
       .from("outreach_campaigns").update(record)
       .eq("campaign_id", existing[0].campaign_id).select().single();
     if (error) throw new Error(`Update failed: ${error.message}`);
-    return data;
+    campaign = data;
   } else {
     const { data, error } = await supabase
       .from("outreach_campaigns").insert(record).select().single();
     if (error) throw new Error(`Insert failed: ${error.message}`);
-    return data;
+    campaign = data;
   }
+
+  // Update confirmed matches to outreach_sent and link campaign_id
+  if (confirmedMatches.length > 0 && campaign) {
+    const matchIds = confirmedMatches.map(cm => cm.match_id);
+    await supabase
+      .from("job_dm_matches")
+      .update({ status: "outreach_sent", campaign_id: campaign.campaign_id })
+      .in("match_id", matchIds);
+  }
+
+  return campaign;
 }
 
 Deno.serve(async (req: Request) => {
@@ -806,7 +920,8 @@ Deno.serve(async (req: Request) => {
 
     const campaign = await saveOutreach(
       intel.dm, taId, intel.companyId, messages,
-      intel.roleClassification, valueHook, qc
+      intel.roleClassification, valueHook, qc,
+      intel.confirmedMatches
     );
 
     console.log(`[generate-outreach v10] DONE campaign=${campaign.campaign_id}`);
